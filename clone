@@ -1,0 +1,103 @@
+#Set-ExecutionPolicy Unrestrictred
+
+param(
+#[Parameter(Mandatory=$True)]
+[String]$clone_prefix = "Clone-",
+[String]$vcenter = "myvcenter.local",
+[String]$cluster = "CLUSTER01",
+[String]$base_clone = "SERVER001",
+[String]$guest_username = "username",
+[String]$guest_password = "password",
+[String]$newip = "10.10.10.10",
+[String]$filepath = "/etc/sysconfig/network-scripts/ifcfg-eth0",
+[Int] $clone_count = 1,
+[bool] $wait_for_ips = $true,
+[bool] $vaai = $true)
+
+Add-PSSnapin VMware.VimAutomation.Core
+#Set-PowerCLIConfiguration -InvalidCertificateAction ignore -confirm:$false
+Connect-VIServer $vcenter
+$cluster = Get-Cluster | where {$_.name -eq $cluster}
+$hosts = Get-VMHost -Location $cluster
+$source_vm = Get-VM -Location $cluster | where {$_.name -like $base_clone } | Get-View
+$clone_folder = $source_vm.parent
+$clone_spec = new-object Vmware.Vim.VirtualMachineCloneSpec
+$clone_spec.Location = new-object Vmware.Vim.VirtualMachineRelocateSpec
+$clone_spec.Location.Transform = [Vmware.Vim.VirtualMachineRelocateTransformation]::flat
+
+if ($vaai) {
+Write-Host "Cloning VM $base_clone using VAAI."
+$clone_spec.Location.DiskMoveType = [Vmware.Vim.VirtualMachineRelocateDiskMoveOptions]::moveAllDiskBackingsAndAllowSharing
+}else {
+Write-Host "Cloning VM $base_clone without VAAI."
+$clone_spec.Location.DiskMoveType = [Vmware.Vim.VirtualMachineRelocateDiskMoveOptions]::createNewChildDiskBacking
+$clone_spec.Snapshot = $source_vm.Snapshot.CurrentSnapshot
+}
+
+$global:baslangic_zaman = Get-Date
+$clone_name = "$clone_prefix$base_clone"
+# Erase old VM.
+
+Write-Host "Stopping VM $clone_name"
+Stop-VM -VM $clone_name -Kill -Confirm:$false | Out-Null
+
+Write-Host "Removing OLD VM $clone_name"
+Remove-VM $clone_name -DeletePermanently -Confirm:$false | Out-Null
+
+Write-Host "Starting to clone $clone_name"
+
+$global:clone_zaman = Get-Date
+$clone_spec.Location.host = $hosts[$i % $hosts.count].Id
+$source_vm.CloneVM_Task( $clone_folder, $clone_name, $clone_spec ) | Out-Null
+
+Write-Host "Waiting for VMs to register on Vcenter."
+
+$ClonedVM = Get-VM -Location $cluster -Name "$clone_name*"
+while($ClonedVM.count -lt $clone_count){
+$count = $ClonedVM.count
+$ClonedVM = Get-VM -Location $cluster -Name "$clone_name*"
+}
+
+Write-Host "Power on VM and wait to vmware tools boot."
+$global:poweron_zaman = Get-Date
+Start-VM $clone_name | Out-Null
+
+$booted_clones = New-Object System.Collections.ArrayList
+while($booted_clones.count -lt $clone_count){
+$clones = Get-VM -Location $cluster -Name "$clone_name*"
+foreach ($clone in $clones){
+if((-not $booted_clones.contains($clone.Name)) -and ($clone.PowerState -eq "PoweredOn")){
+Write-Host "Fiziksel network kopar"
+Get-NetworkAdapter -VM $clone.name | Set-NetworkAdapter -StartConnected:$false -Connected:$false -Confirm:$false | Out-Null
+if($wait_for_ips){
+$ip = $clone.Guest.IPAddress[0]
+if ($ip){
+Write-Host "$clone VM Tools started, VM Current ip: $ip"
+$global:change_zaman = Get-Date
+Write-Host "eth0 ipsini degistiriyoruz"
+Invoke-VMscript -VM $clone.name -Scripttext "sed -i.bak 's/$ip/$newip/g' $filepath && service network stop" -GuestUser $guest_username -GuestPassword $guest_password | Out-Null
+Write-Host "Fisikel Networku tekrar bagla"
+Get-NetworkAdapter -VM $clone.name | Set-NetworkAdapter -StartConnected:$true -Connected:$true -Confirm:$false | Out-Null
+Write-Host "Guest Networku aciyoruz"
+Invoke-VMscript -VM $clone.name -Scripttext "service network start" -GuestUser $guest_username -GuestPassword $guest_password | Out-Null
+$booted_clones.add($clone.Name)
+}
+}
+else{
+$booted_clones.add($clone.Name)
+}
+
+}
+}
+}
+
+$global:toplam_zaman = $(Get-Date) - $global:baslangic_zaman
+$global:eskisil_zaman = $global:clone_zaman - $global:baslangic_zaman
+$global:toplamclone_zaman = $poweron_zaman - $global:clone_zaman
+
+Write-Host "Eski imaji silme zamani : $eskisil_zaman "
+Write-Host "Toplam clone yaratma zamani : $toplamclone_zaman "
+Write-Host "Script calisma zamani : $global:toplam_zaman"
+
+Disconnect-VIServer $vcenter -Confirm:$false
+Write-Host "vCenter disconnected"
